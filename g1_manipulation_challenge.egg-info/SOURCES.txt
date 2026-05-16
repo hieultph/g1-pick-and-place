@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+g1_manipulation_challenge.egg-info/PKG-INFO
+g1_manipulation_challenge.egg-info/SOURCES.txt
+g1_manipulation_challenge.egg-info/dependency_links.txt
+g1_manipulation_challenge.egg-info/requires.txt
+g1_manipulation_challenge.egg-info/top_level.txt
