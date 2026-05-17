@@ -204,7 +204,7 @@
             <geom class="visual" pos="0.0039635 0 -0.044" material="black" mesh="head_link"/>
             <geom name="torso_collision" class="collision" size="0.09" fromto="0.01 0 0.08 0.01 0 0.2"/>
             <geom name="head_collision" class="collision" type="sphere" size="0.06" pos="0 0 .43"/>
-            <camera name="head_cam" pos="0.05 0 0.43" xyaxes="0 -1 0 0.34 0 0.94" fovy="60"/>
+            <camera name="head_cam" pos="0.05 0 0.30" xyaxes="0 -1 0 0.60 0 0.80" fovy="60"/>
             <site name="imu_in_torso" size="0.01" pos="-0.03959 -0.00224 0.14792"/>
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.24778"
               quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
