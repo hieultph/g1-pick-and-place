@@ -480,7 +480,7 @@ class TeleoperateController:
         return np.array([self._qpos(n) for n in names], dtype=np.float32)
 
     def _render_head(self) -> np.ndarray:
-        self._obs_renderer.update_scene(self.data, camera="head_cam")
+        self._obs_renderer.update_scene(self.data, camera="cam_left_high")
         return self._obs_renderer.render().copy()
 
     def _print_status(self):
@@ -906,12 +906,12 @@ def main():
                 now = time.time()
                 if now - last_prev >= prev_intv:
                     last_prev = now
-                    preview_renderer.update_scene(data, camera="head_cam")
+                    preview_renderer.update_scene(data, camera="cam_left_high")
                     img = preview_renderer.render()
-                    _cv2.imshow("head_cam", _cv2.cvtColor(img, _cv2.COLOR_RGB2BGR))
-                    preview_renderer.update_scene(data, camera="wrist_cam")
+                    _cv2.imshow("cam_left_high", _cv2.cvtColor(img, _cv2.COLOR_RGB2BGR))
+                    preview_renderer.update_scene(data, camera="cam_right_wrist")
                     wimg = preview_renderer.render()
-                    _cv2.imshow("wrist_cam", _cv2.cvtColor(wimg, _cv2.COLOR_RGB2BGR))
+                    _cv2.imshow("cam_right_wrist", _cv2.cvtColor(wimg, _cv2.COLOR_RGB2BGR))
                     if _cv2.waitKey(1) & 0xFF == 27:
                         break
 

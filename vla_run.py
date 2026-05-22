@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,7 @@ DATASET_INIT_QPOS = {
 LANGUAGE_KEY = "annotation.human.task_description"
 VIDEO_KEYS = ["cam_left_high", "cam_right_high", "cam_left_wrist", "cam_right_wrist"]  # matches finetuning dataset
 ACTION_HORIZON = 40
-EXEC_HORIZON = 40  # how many predicted actions to execute before re-querying
+EXEC_HORIZON = 16  # how many predicted actions to execute before re-querying
 IMG_H = 480
 IMG_W = 640
 
@@ -445,12 +446,15 @@ class VLAController:
         self.last_action = np.zeros(self.num_joints, dtype=np.float32)
         self.cmd = np.zeros(3, dtype=np.float32)  # zero vel — stationary
 
-        self.frame_hist: list[np.ndarray] = []  # kept for potential future use
-
         # Action chunk + per-chunk reference state (the "current state" at inference time)
         self.chunk: dict[str, np.ndarray] | None = None
         self.chunk_step = 0
         self.chunk_ref: dict[str, np.ndarray] | None = None
+
+        # Async inference — background thread so the sim loop never blocks.
+        self._infer_lock    = threading.Lock()
+        self._pending_chunk: tuple | None = None   # (chunk_dict, elapsed_s)
+        self._infer_thread: threading.Thread | None = None
 
         # Renderer for camera observations (separate from preview)
         self.obs_renderer = mujoco.Renderer(model, IMG_H, IMG_W)
@@ -579,50 +583,58 @@ class VLAController:
                         hand_ctrl[self.hand_act[n]] = float(vals[i])
         return hand_ctrl
 
+    # ------- async VLA inference (runs in background thread) -------
+    def _run_inference(self, obs_dict: dict, cur_state: dict):
+        try:
+            t0 = time.time()
+            action_chunk = self.client.get_action(obs_dict)
+            dt = time.time() - t0
+            chunk = {k: np.asarray(v)[0] for k, v in action_chunk.items()}
+            with self._infer_lock:
+                self._pending_chunk = (chunk, cur_state, dt)
+        except Exception as e:
+            print(f"[VLA] async inference failed: {e!r}")
+
     # ------- main step (called at 50 Hz control rate) -------
     def step(self) -> tuple[np.ndarray, dict[int, float]]:
         if self.freeze_non_arm:
-            # No walker: pin everything to default. Only arms (and hands) get VLA targets.
             target_body = self.default.copy()
         else:
-            # Walker: full 29D body targets (legs + everything)
             obs = self._walker_obs()
             action = self.walker(obs)
             target_body = self.default + action * self.action_scales
             self.last_action = action.copy()
 
-        # 2) Frame history (no longer used for video obs, kept for debugging)
-        self.frame_hist.append(self._render_cameras()[VIDEO_KEYS[0]])
-        if len(self.frame_hist) > 5:
-            self.frame_hist.pop(0)
-
-        # 3) VLA chunk: query if we don't have one or we've executed enough
-        if self.chunk is None or self.chunk_step >= EXEC_HORIZON:
-            try:
-                obs_dict, cur_state = self._build_observation()
-                if self.save_obs_dir:
-                    self._save_observation(obs_dict, cur_state)
-                t0 = time.time()
-                action_chunk = self.client.get_action(obs_dict)
-                dt = time.time() - t0
-                # Strip batch dim -> (T, D)
-                self.chunk = {k: np.asarray(v)[0] for k, v in action_chunk.items()}
-                self.chunk_ref = cur_state
+        # 2) Swap in completed async chunk if ready.
+        with self._infer_lock:
+            if self._pending_chunk is not None:
+                chunk, cur_state, dt = self._pending_chunk
+                self._pending_chunk = None
+                self.chunk      = chunk
+                self.chunk_ref  = cur_state
                 self.chunk_step = 0
-                la0 = self.chunk["left_arm"][0]
-                ra0 = self.chunk["right_arm"][0]
-                T = next(iter(self.chunk.values())).shape[0]
-                print(f"[VLA] new chunk ({dt:.2f}s). keys={list(self.chunk.keys())} horizon={T}")
-                print(f"[VLA] state  left_arm ={np.round(cur_state['left_arm'], 3).tolist()}")
+                T   = next(iter(chunk.values())).shape[0]
+                la0 = chunk["left_arm"][0]
+                ra0 = chunk["right_arm"][0]
+                print(f"[VLA] new chunk ({dt:.2f}s)  horizon={T}  keys={list(chunk.keys())}")
+                print(f"[VLA] state  left_arm ={np.round(cur_state['left_arm'],  3).tolist()}")
                 print(f"[VLA] action left_arm[0]={np.round(la0, 3).tolist()}")
                 print(f"[VLA] state  right_arm={np.round(cur_state['right_arm'], 3).tolist()}")
                 print(f"[VLA] action right_arm[0]={np.round(ra0, 3).tolist()}")
-                print(f"[VLA] chunk keys={list(self.chunk.keys())}")
-            except Exception as e:
-                print(f"[VLA] inference failed: {e!r}")
-                # keep walker targets only
 
-        # 4) Apply chunk to override upper body
+        # 3) Kick off next inference when the current chunk is nearly exhausted,
+        #    but only if no request is already in flight.
+        infer_running = self._infer_thread is not None and self._infer_thread.is_alive()
+        if not infer_running and (self.chunk is None or self.chunk_step >= EXEC_HORIZON):
+            obs_dict, cur_state = self._build_observation()
+            if self.save_obs_dir:
+                self._save_observation(obs_dict, cur_state)
+            self._infer_thread = threading.Thread(
+                target=self._run_inference, args=(obs_dict, cur_state), daemon=True
+            )
+            self._infer_thread.start()
+
+        # 4) Apply current chunk to override upper body (sim continues unblocked).
         hand_ctrl: dict[int, float] = {}
         if self.chunk is not None:
             hand_ctrl = self._apply_chunk_targets(target_body)
@@ -665,6 +677,60 @@ class VLAController:
                 self.data.ctrl[aid] = target_body[i]
         for aid, v in hand_ctrl.items():
             self.data.ctrl[aid] = v
+
+
+# --------------------------------------------------------------------------- #
+# Object randomization
+# --------------------------------------------------------------------------- #
+_OBJ_SPAWN = {
+    # joint_name        half-height  upright quat [w,x,y,z]
+    "red_cube_joint":   (0.035, [1.0, 0.0, 0.0, 0.0]),   # cylinder, z-axis up
+    "green_cube_joint": (0.040, [1.0, 0.0, 0.0, 0.0]),   # box, z-axis up
+}
+_TABLE_TOP_Z    = 0.84          # table surface (world frame)
+_YELLOW_CENTER  = np.array([-0.20, 0.00])
+_SPAWN_X        = (-0.35, -0.05)   # reachable x band
+_SPAWN_Y        = (-0.35,  0.35)   # reachable y band
+_MIN_YELLOW     = 0.16          # keep this far from yellow-box centre
+_MIN_OBJECTS    = 0.12          # keep objects this far from each other
+
+
+def randomize_objects(model, data, seed=None):
+    """Place grippable objects at random reachable positions on the table."""
+    rng = np.random.default_rng(seed)
+    placed: list[np.ndarray] = []
+
+    for jname, (half_z, quat_init) in _OBJ_SPAWN.items():
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        if jid < 0:
+            print(f"[spawn] joint {jname!r} not found — skipping")
+            continue
+        addr = int(model.jnt_qposadr[jid])
+        dof  = int(model.jnt_dofadr[jid])
+
+        for attempt in range(200):
+            x = rng.uniform(*_SPAWN_X)
+            y = rng.uniform(*_SPAWN_Y)
+            xy = np.array([x, y])
+
+            if np.linalg.norm(xy - _YELLOW_CENTER) < _MIN_YELLOW:
+                continue
+            if any(np.linalg.norm(xy - p) < _MIN_OBJECTS for p in placed):
+                continue
+
+            z = _TABLE_TOP_Z + half_z + 0.003   # tiny clearance above table
+            yaw = rng.uniform(0, 2 * np.pi)
+            qw, qz = np.cos(yaw / 2), np.sin(yaw / 2)
+
+            data.qpos[addr:addr + 3]     = [x, y, z]
+            data.qpos[addr + 3:addr + 7] = [qw, 0.0, 0.0, qz]
+            data.qvel[dof:dof + 6]       = 0.0
+            placed.append(xy)
+            print(f"[spawn] {jname}: x={x:.3f}  y={y:.3f}  yaw={np.degrees(yaw):.1f}°"
+                  f"  (attempt {attempt+1})")
+            break
+        else:
+            print(f"[spawn] WARNING: could not place {jname} after 200 attempts")
 
 
 # --------------------------------------------------------------------------- #
@@ -720,6 +786,8 @@ def main():
         if jid >= 0:
             data.qpos[int(model.jnt_qposadr[jid])] = v
     mujoco.mj_forward(model, data)
+    randomize_objects(model, data)
+    mujoco.mj_forward(model, data)   # update xpos/xmat after repositioning
 
     # Walker
     print("[init] Loading walker.onnx")
@@ -856,6 +924,8 @@ def main():
 
     with viewer.launch_passive(model, data, key_callback=_on_key) as v:
         t0 = time.time()
+        _hz_last_wall = t0
+        _hz_step_count = 0
         while v.is_running():
             wall = time.time() - t0
             if wall - sim_time > 0.05:
@@ -865,6 +935,16 @@ def main():
                     target_body, hand_ctrl = ctrl.step()
                 ctrl.write_ctrl(target_body, hand_ctrl)
                 mujoco.mj_step(model, data)
+                _hz_step_count += 1
+                if _hz_step_count >= 200:  # print every 200 sim steps (~1 s at 200 Hz)
+                    now = time.time()
+                    elapsed = now - _hz_last_wall
+                    sim_hz  = _hz_step_count / elapsed          # actual sim step rate
+                    ctrl_hz = (_hz_step_count / decimation) / elapsed  # control policy rate
+                    print(f"[hz] sim={sim_hz:.1f} Hz  ctrl={ctrl_hz:.1f} Hz  "
+                          f"(target sim=200 Hz, ctrl=50 Hz)")
+                    _hz_last_wall = now
+                    _hz_step_count = 0
                 if ctrl.freeze_non_arm:
                     # Pin floating base in place (kinematic freeze).
                     data.qpos[:7] = ctrl._base_qpos0
