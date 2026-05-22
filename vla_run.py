@@ -49,23 +49,58 @@ RIGHT_ARM_JOINTS = [
     "right_wrist_yaw_joint",
 ]
 WAIST_JOINTS = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+# Order matches dataset (info.json feature names):
+# left_hand:  kLeftHandThumb0/1/2, kLeftHandMiddle0/1, kLeftHandIndex0/1
+# right_hand: kRightHandThumb0/1/2, kRightHandIndex0/1, kRightHandMiddle0/1
 LEFT_HAND_JOINTS = [
-    "left_hand_index_0_joint", "left_hand_index_1_joint",
-    "left_hand_middle_0_joint", "left_hand_middle_1_joint",
     "left_hand_thumb_0_joint", "left_hand_thumb_1_joint", "left_hand_thumb_2_joint",
+    "left_hand_middle_0_joint", "left_hand_middle_1_joint",
+    "left_hand_index_0_joint", "left_hand_index_1_joint",
 ]
 RIGHT_HAND_JOINTS = [
+    "right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
     "right_hand_index_0_joint", "right_hand_index_1_joint",
     "right_hand_middle_0_joint", "right_hand_middle_1_joint",
-    "right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
 ]
 
+# Dataset initial joint positions (from real-robot trajectory, same as teleoperate.py)
+DATASET_INIT_QPOS = {
+    "left_shoulder_pitch_joint":  -0.186601,
+    "left_shoulder_roll_joint":    0.316981,
+    "left_shoulder_yaw_joint":     0.287689,
+    "left_elbow_joint":           -0.635120,
+    "left_wrist_roll_joint":      -0.243937,
+    "left_wrist_pitch_joint":      0.690306,
+    "left_wrist_yaw_joint":       -0.015776,
+    "right_shoulder_pitch_joint": -0.364927,
+    "right_shoulder_roll_joint":  -0.258941,
+    "right_shoulder_yaw_joint":   -0.201870,
+    "right_elbow_joint":          -0.514582,
+    "right_wrist_roll_joint":      0.261457,
+    "right_wrist_pitch_joint":     0.718800,
+    "right_wrist_yaw_joint":       0.073139,
+    "left_hand_thumb_0_joint":    -0.427740,
+    "left_hand_thumb_1_joint":     1.028506,
+    "left_hand_thumb_2_joint":     0.184237,
+    "left_hand_middle_0_joint":    0.175383,
+    "left_hand_middle_1_joint":   -0.047019,
+    "left_hand_index_0_joint":     0.184752,
+    "left_hand_index_1_joint":    -0.015129,
+    "right_hand_thumb_0_joint":   -0.404762,
+    "right_hand_thumb_1_joint":   -1.038415,
+    "right_hand_thumb_2_joint":   -0.326415,
+    "right_hand_index_0_joint":   -0.189341,
+    "right_hand_index_1_joint":    0.012102,
+    "right_hand_middle_0_joint":  -0.184233,
+    "right_hand_middle_1_joint":   0.011182,
+}
+
 LANGUAGE_KEY = "annotation.human.task_description"
-VIDEO_KEY = "ego_view"
-VIDEO_DELTA = -20  # second video frame is current frame; first is 20 ctrl steps ago
+VIDEO_KEYS = ["cam_left_high", "cam_right_high", "cam_left_wrist", "cam_right_wrist"]  # matches finetuning dataset
 ACTION_HORIZON = 40
-EXEC_HORIZON = 8  # how many predicted actions to execute before re-querying
-IMG_SIZE = 224
+EXEC_HORIZON = 40  # how many predicted actions to execute before re-querying
+IMG_H = 480
+IMG_W = 640
 
 
 # --------------------------------------------------------------------------- #
@@ -172,6 +207,13 @@ def eef_9d(site_xpos_world, site_xmat_world, base_pos, base_quat):
     return np.concatenate([pos_rel, rot6d]).astype(np.float32)
 
 
+def mat_to_quat(mat: np.ndarray) -> np.ndarray:
+    """Convert a 3×3 rotation matrix to a MuJoCo quaternion (w, x, y, z)."""
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, mat.flatten())
+    return q
+
+
 def set_armature(model, joint_names):
     A_5020, A_7520_14, A_7520_22, A_4010, A_2x = 0.00360972, 0.01017752, 0.02510192, 0.00425, 0.00721945
     for i, name in enumerate(joint_names):
@@ -188,6 +230,155 @@ def set_armature(model, joint_names):
             model.dof_armature[dof] = A_2x
         else:
             model.dof_armature[dof] = A_5020
+
+
+# --------------------------------------------------------------------------- #
+# Grip assist
+# --------------------------------------------------------------------------- #
+class GripAssist:
+    """Kinematically attach a grippable object to the palm when the hand is close.
+
+    When the palm site is within GRIP_DIST of a cube, the cube's freejoint is
+    overridden every step so the cube rigidly follows the hand.  Once latched,
+    the grip releases only when the VLA returns the fingers toward the open
+    (dataset-init) pose — detected by a low mean deviation of finger-joint qpos
+    from the init values.
+    """
+
+    GRIP_DIST   = 0.08  # metres — latch when palm is within this radius of cube
+    # Raw closure thresholds based on actual joint ranges from g1.xml:
+    #   right index_0: range [0, 1.5708]  →  0 = open, positive = curling
+    #   left  index_0: range [-1.5708, 0] →  0 = open, negative = curling
+    # closure = signed_value * closing_direction, so it is always ≥ 0 when curling.
+    GRIP_THRESH = 0.30  # closure above this → hand is gripping
+    OPEN_THRESH = 0.08  # closure below this → hand is open  (must be < GRIP_THRESH)
+    MIN_GRIP_STEPS = 20 # debounce: keep latched for at least this many steps
+
+    # Closing direction: +1 means positive qpos = curled (right), -1 means negative = curled (left).
+    _CLOSE_DIR = {"right": +1.0, "left": -1.0}
+    # Primary index_0 joint per hand — the joint that moves most during a grip.
+    _INDEX0_JOINT = {"right": "right_hand_index_0_joint", "left": "left_hand_index_0_joint"}
+
+    def __init__(self, model, data):
+        self.model = model
+        self.data  = data
+
+        # Grippable objects: body id + freejoint qpos/dof start addresses.
+        _obj_joints = {"red_cube": "red_cube_joint", "green_cube": "green_cube_joint"}
+        self._obj_body: dict[str, int] = {}
+        self._obj_qpos: dict[str, int] = {}
+        self._obj_dof:  dict[str, int] = {}
+        for bname, jname in _obj_joints.items():
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,  bname)
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if bid >= 0 and jid >= 0:
+                self._obj_body[bname] = bid
+                self._obj_qpos[bname] = int(model.jnt_qposadr[jid])
+                self._obj_dof [bname] = int(model.jnt_dofadr [jid])
+
+        # Palm site ids.
+        self._palm = {
+            "left":  mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left_palm"),
+            "right": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "right_palm"),
+        }
+
+        # index_0 qpos address per hand — used as the primary grip/release sensor.
+        # We read the raw joint value and multiply by _CLOSE_DIR to get a
+        # non-negative "closure" score (0 = fully open, ~1.57 = fully closed).
+        self._index0_addr: dict[str, int] = {}
+        for hand, jname in self._INDEX0_JOINT.items():
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid >= 0:
+                self._index0_addr[hand] = int(model.jnt_qposadr[jid])
+
+        # Active grip state: hand → (obj_name, rel_pos_in_palm_frame, rel_quat_palm2obj)
+        self._grip:       dict[str, tuple | None] = {"left": None, "right": None}
+        self._grip_steps: dict[str, int]          = {"left": 0,    "right": 0}
+        self._log_counter = 0  # for periodic debug prints
+
+    # ------------------------------------------------------------------ #
+    def _palm_pose(self, hand: str) -> tuple[np.ndarray, np.ndarray]:
+        sid = self._palm[hand]
+        pos = self.data.site_xpos[sid].copy()
+        mat = self.data.site_xmat[sid].reshape(3, 3).copy()
+        return pos, mat
+
+    def _index_closure(self, hand: str) -> float:
+        """Raw closure of index_0: joint_value * closing_direction (≥0 when curling)."""
+        addr = self._index0_addr.get(hand)
+        if addr is None:
+            return 0.0
+        return float(self.data.qpos[addr]) * self._CLOSE_DIR[hand]
+
+    def update(self):
+        """Call once per simulation step, after mj_step."""
+        self._log_counter += 1
+        latched: set[str] = {
+            info[0] for info in self._grip.values() if info is not None
+        }
+
+        for hand in ("left", "right"):
+            palm_pos, palm_mat = self._palm_pose(hand)
+            palm_quat = mat_to_quat(palm_mat)
+            idx_closure = self._index_closure(hand)
+
+            # Periodic debug: raw joint value + closure so thresholds can be tuned.
+            if self._log_counter % 200 == 0:
+                addr = self._index0_addr.get(hand)
+                raw = float(self.data.qpos[addr]) if addr is not None else float("nan")
+                state = "GRIP" if self._grip[hand] else "open"
+                print(f"[grip] {hand} index_0 raw={raw:+.3f}  closure={idx_closure:.3f}"
+                      f"  (latch>{self.GRIP_THRESH}, release<{self.OPEN_THRESH})"
+                      f"  [{state}]")
+
+            if self._grip[hand] is not None:
+                obj_name, rel_pos, rel_quat = self._grip[hand]
+                self._grip_steps[hand] += 1
+
+                # Teleport cube so it rigidly follows the palm.
+                new_pos  = palm_pos + palm_mat @ rel_pos
+                new_quat = quat_mul(palm_quat, rel_quat)
+                addr = self._obj_qpos[obj_name]
+                self.data.qpos[addr:addr + 3] = new_pos
+                self.data.qpos[addr + 3:addr + 7] = new_quat
+                self.data.qvel[self._obj_dof[obj_name]:self._obj_dof[obj_name] + 6] = 0.0
+
+                # Release when index finger returns toward open pose.
+                if (self._grip_steps[hand] > self.MIN_GRIP_STEPS
+                        and idx_closure < self.OPEN_THRESH):
+                    # Drop the object below the palm so it clears the thumb geometry,
+                    # then give it a downward velocity impulse to escape any remaining
+                    # finger contact before handing control back to physics.
+                    obj_addr = self._obj_qpos[obj_name]
+                    obj_dof  = self._obj_dof[obj_name]
+                    self.data.qpos[obj_addr + 2] -= 0.05          # 5 cm below current pos
+                    self.data.qvel[obj_dof:obj_dof + 3]     = [0.0, 0.0, -0.5]  # drop velocity
+                    self.data.qvel[obj_dof + 3:obj_dof + 6] = 0.0
+                    print(f"[grip] {hand} released {obj_name} "
+                          f"(index closure={idx_closure:.3f} < OPEN_THRESH={self.OPEN_THRESH})")
+                    self._grip[hand] = None
+                    self._grip_steps[hand] = 0
+                    latched.discard(obj_name)
+
+            else:
+                # Latch only when index finger is closing AND palm is close to cube.
+                if idx_closure < self.GRIP_THRESH:
+                    continue  # index finger is open — don't attach anything
+                for obj_name, body_id in self._obj_body.items():
+                    if obj_name in latched:
+                        continue
+                    obj_pos  = self.data.xpos[body_id].copy()
+                    obj_quat = self.data.xquat[body_id].copy()
+                    dist = np.linalg.norm(palm_pos - obj_pos)
+                    if dist < self.GRIP_DIST:
+                        rel_pos  = palm_mat.T @ (obj_pos - palm_pos)
+                        rel_quat = quat_mul(quat_inv(palm_quat), obj_quat)
+                        self._grip[hand]       = (obj_name, rel_pos, rel_quat)
+                        self._grip_steps[hand] = 0
+                        latched.add(obj_name)
+                        print(f"[grip] {hand} latched {obj_name} "
+                              f"(dist={dist:.3f} m, index closure={idx_closure:.3f})")
+                        break
 
 
 # --------------------------------------------------------------------------- #
@@ -220,17 +411,9 @@ class VLAController:
         for n, v in config["default_joint_pos"].items():
             if n in self.joint_names:
                 self.default[self.joint_names.index(n)] = v
-        # Override arm defaults to match REAL_G1 training distribution mean.
-        _arm_defaults = {
-            "left_shoulder_pitch_joint": -0.24, "left_shoulder_roll_joint": 0.26,
-            "left_shoulder_yaw_joint": -0.22, "left_elbow_joint": 0.07,
-            "left_wrist_roll_joint": -0.12, "left_wrist_pitch_joint": 0.01,
-            "left_wrist_yaw_joint": 0.12,
-            "right_shoulder_pitch_joint": -0.25, "right_shoulder_roll_joint": -0.29,
-            "right_shoulder_yaw_joint": 0.13, "right_elbow_joint": 0.08,
-            "right_wrist_roll_joint": 0.02, "right_wrist_pitch_joint": 0.03,
-            "right_wrist_yaw_joint": -0.10,
-        }
+        # Override arm defaults to match dataset initial pose (teleoperate.py convention).
+        _arm_defaults = {n: v for n, v in DATASET_INIT_QPOS.items()
+                         if n in (LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS)}
         for n, v in _arm_defaults.items():
             if n in self.joint_names:
                 self.default[self.joint_names.index(n)] = v
@@ -262,16 +445,15 @@ class VLAController:
         self.last_action = np.zeros(self.num_joints, dtype=np.float32)
         self.cmd = np.zeros(3, dtype=np.float32)  # zero vel — stationary
 
-        # Frame buffer: head_cam history (most-recent first), used to assemble video.ego_view
-        self.frame_hist: list[np.ndarray] = []
+        self.frame_hist: list[np.ndarray] = []  # kept for potential future use
 
         # Action chunk + per-chunk reference state (the "current state" at inference time)
         self.chunk: dict[str, np.ndarray] | None = None
         self.chunk_step = 0
         self.chunk_ref: dict[str, np.ndarray] | None = None
 
-        # Renderer for head_cam observation (separate from preview)
-        self.obs_renderer = mujoco.Renderer(model, IMG_SIZE, IMG_SIZE)
+        # Renderer for camera observations (separate from preview)
+        self.obs_renderer = mujoco.Renderer(model, IMG_H, IMG_W)
 
         # Optional: save every server observation to disk for debugging
         self.save_obs_dir = Path(save_obs_dir) if save_obs_dir else None
@@ -305,41 +487,31 @@ class VLAController:
                                self.last_action, self.cmd]).astype(np.float32)
 
     # ------- VLA observation -------
-    def _render_head_cam(self) -> np.ndarray:
-        self.obs_renderer.update_scene(self.data, camera="head_cam")
-        return self.obs_renderer.render().copy()  # (H, W, 3) uint8
+    def _render_cameras(self) -> dict[str, np.ndarray]:
+        frames = {}
+        for cam in VIDEO_KEYS:
+            self.obs_renderer.update_scene(self.data, camera=cam)
+            frames[cam] = self.obs_renderer.render().copy()  # (H, W, 3) uint8
+        return frames
 
     def _build_observation(self) -> dict[str, Any]:
-        base_pos, base_quat = self._base_pose()
-        l_palm_xpos = self.data.site_xpos[self.left_palm]
-        l_palm_xmat = self.data.site_xmat[self.left_palm]
-        r_palm_xpos = self.data.site_xpos[self.right_palm]
-        r_palm_xmat = self.data.site_xmat[self.right_palm]
-
+        # State keys must match finetuning modality (G1_Dex3_ObjectPlacement_Dataset):
+        # left_arm, right_arm, left_hand, right_hand only.
         state = {
-            "left_wrist_eef_9d": eef_9d(l_palm_xpos, l_palm_xmat, base_pos, base_quat),
-            "right_wrist_eef_9d": eef_9d(r_palm_xpos, r_palm_xmat, base_pos, base_quat),
-            "left_hand": self._joint_array(LEFT_HAND_JOINTS),
-            "right_hand": self._joint_array(RIGHT_HAND_JOINTS),
             "left_arm": self._joint_array(LEFT_ARM_JOINTS),
             "right_arm": self._joint_array(RIGHT_ARM_JOINTS),
-            "waist": self._joint_array(WAIST_JOINTS),
+            "left_hand": self._joint_array(LEFT_HAND_JOINTS),
+            "right_hand": self._joint_array(RIGHT_HAND_JOINTS),
         }
         # Wrap each (D,) -> (1 batch, 1 timestep, D)
         state_batched = {k: v[None, None, :] for k, v in state.items()}
 
-        # Video: 2 frames -> (1, 2, H, W, 3)
-        cur = self._render_head_cam()
-        if len(self.frame_hist) >= abs(VIDEO_DELTA):
-            past = self.frame_hist[-abs(VIDEO_DELTA)]
-        elif self.frame_hist:
-            past = self.frame_hist[0]
-        else:
-            past = cur
-        video = np.stack([past, cur], axis=0)[None]  # (1, 2, H, W, 3)
+        # Video: 1 frame per camera -> (1, 1, H, W, 3) — dataset horizon=1
+        frames = self._render_cameras()
+        video = {k: v[None, None] for k, v in frames.items()}
 
         return {
-            "video": {VIDEO_KEY: video},
+            "video": video,
             "state": state_batched,
             "language": {LANGUAGE_KEY: [[self.prompt]]},
         }, state  # also return current state for delta integration
@@ -396,7 +568,6 @@ class VLAController:
 
         apply_joint_group(LEFT_ARM_JOINTS, "left_arm")
         apply_joint_group(RIGHT_ARM_JOINTS, "right_arm")
-        apply_joint_group(WAIST_JOINTS, "waist")
 
         hand_ctrl: dict[int, float] = {}
         if self.apply_hands:
@@ -420,9 +591,9 @@ class VLAController:
             target_body = self.default + action * self.action_scales
             self.last_action = action.copy()
 
-        # 2) Frame history (cheap — just append latest)
-        self.frame_hist.append(self._render_head_cam())
-        if len(self.frame_hist) > abs(VIDEO_DELTA) + 5:
+        # 2) Frame history (no longer used for video obs, kept for debugging)
+        self.frame_hist.append(self._render_cameras()[VIDEO_KEYS[0]])
+        if len(self.frame_hist) > 5:
             self.frame_hist.pop(0)
 
         # 3) VLA chunk: query if we don't have one or we've executed enough
@@ -446,19 +617,7 @@ class VLAController:
                 print(f"[VLA] action left_arm[0]={np.round(la0, 3).tolist()}")
                 print(f"[VLA] state  right_arm={np.round(cur_state['right_arm'], 3).tolist()}")
                 print(f"[VLA] action right_arm[0]={np.round(ra0, 3).tolist()}")
-                # EEF z trajectory: diagnose whether model plans to go up or down
-                leef_z = self.chunk["left_wrist_eef_9d"][:, 2]
-                reef_z = self.chunk["right_wrist_eef_9d"][:, 2]
-                print(f"[VLA] left_eef  z: state={cur_state['left_wrist_eef_9d'][2]:.3f} "
-                      f"chunk=[{leef_z[0]:.3f},{leef_z[4]:.3f},{leef_z[9]:.3f},{leef_z[19]:.3f},{leef_z[T-1]:.3f}] (t=0,4,9,19,39)")
-                print(f"[VLA] right_eef z: state={cur_state['right_wrist_eef_9d'][2]:.3f} "
-                      f"chunk=[{reef_z[0]:.3f},{reef_z[4]:.3f},{reef_z[9]:.3f},{reef_z[19]:.3f},{reef_z[T-1]:.3f}] (t=0,4,9,19,39)")
-                nav = self.chunk.get("navigate_command")
-                bh = self.chunk.get("base_height_command")
-                if nav is not None:
-                    print(f"[VLA] navigate_command[0]={np.round(nav[0], 3).tolist()}")
-                if bh is not None:
-                    print(f"[VLA] base_height[0]={np.round(bh[0], 3).tolist()}")
+                print(f"[VLA] chunk keys={list(self.chunk.keys())}")
             except Exception as e:
                 print(f"[VLA] inference failed: {e!r}")
                 # keep walker targets only
@@ -478,11 +637,9 @@ class VLAController:
         prefix = self.save_obs_dir / f"obs_{idx:04d}"
 
         # --- images ---
-        video = obs_dict["video"][VIDEO_KEY]  # (1, 2, H, W, 3)
-        past_frame = video[0, 0]
-        cur_frame = video[0, 1]
-        Image.fromarray(past_frame).save(f"{prefix}_frame_past.png")
-        Image.fromarray(cur_frame).save(f"{prefix}_frame_current.png")
+        for cam_name, video in obs_dict["video"].items():
+            cur_frame = video[0, 0]
+            Image.fromarray(cur_frame).save(f"{prefix}_frame_{cam_name}.png")
 
         # --- JSON (human-readable) ---
         json_data = {
@@ -528,6 +685,8 @@ def main():
     ap.add_argument("--save-obs-dir", default=None,
                     help="Directory to save every observation sent to the server "
                          "as .npz + .json + .png for debugging.")
+    ap.add_argument("--no-grip-assist", action="store_true",
+                    help="Disable grip assist (kinematic weld when palm is near a cube).")
     args = ap.parse_args()
 
     # Load config + scene
@@ -541,8 +700,13 @@ def main():
     set_armature(model, joint_names)
     data = mujoco.MjData(model)
 
-    # Initial pose (moved back to x=-0.7 so arms clear table at x=-0.40)
-    data.qpos[0] = -0.7
+    # Inject dataset defaults so freeze_non_arm pins joints to the same pose as teleoperate.py
+    for n, v in DATASET_INIT_QPOS.items():
+        if n in config["default_joint_pos"]:
+            config["default_joint_pos"][n] = v
+
+    # Initial pose — x=-0.50 matches teleoperate.py (robot closer to table)
+    data.qpos[0] = -0.50
     data.qpos[2] = 0.76
     data.qpos[3:7] = [1, 0, 0, 0]
     for n, v in config["default_joint_pos"].items():
@@ -550,20 +714,8 @@ def main():
         if jid >= 0:
             addr = int(model.jnt_qposadr[jid])
             data.qpos[addr] = v
-    # Override arm defaults to be closer to REAL_G1 training distribution mean.
-    # model_config defaults (elbow=0.6, shoulder_pitch=0.2) are significantly
-    # OOD vs training mean (elbow≈0.07, shoulder_pitch≈-0.24).
-    arm_init = {
-        "left_shoulder_pitch_joint": -0.24, "left_shoulder_roll_joint": 0.26,
-        "left_shoulder_yaw_joint": -0.22, "left_elbow_joint": 0.07,
-        "left_wrist_roll_joint": -0.12, "left_wrist_pitch_joint": 0.01,
-        "left_wrist_yaw_joint": 0.12,
-        "right_shoulder_pitch_joint": -0.25, "right_shoulder_roll_joint": -0.29,
-        "right_shoulder_yaw_joint": 0.13, "right_elbow_joint": 0.08,
-        "right_wrist_roll_joint": 0.02, "right_wrist_pitch_joint": 0.03,
-        "right_wrist_yaw_joint": -0.10,
-    }
-    for n, v in arm_init.items():
+    # Override arms + hands with dataset initial pose (matches teleoperate.py)
+    for n, v in DATASET_INIT_QPOS.items():
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, n)
         if jid >= 0:
             data.qpos[int(model.jnt_qposadr[jid])] = v
@@ -589,10 +741,14 @@ def main():
                          save_obs_dir=args.save_obs_dir)
     print(f"[mode] freeze_non_arm={ctrl.freeze_non_arm} apply_hands={ctrl.apply_hands}")
 
+    grip_assist = None if args.no_grip_assist else GripAssist(model, data)
+    print(f"[mode] grip_assist={'disabled' if grip_assist is None else 'enabled'}")
+
     # Preview renderer
     preview = None
     if not args.no_preview:
-        preview = mujoco.Renderer(model, 320, 320)
+        preview = mujoco.Renderer(model, 480, 640)
+        print("[init] Camera preview enabled (640×480).")
 
     print(f"[ready] Prompt: {args.prompt!r}")
     print("[ready] Launching viewer — Esc to quit.")
@@ -608,7 +764,97 @@ def main():
     # Snapshot initial floating-base pose so we can pin it every step.
     ctrl._base_qpos0 = data.qpos[:7].copy()
 
-    with viewer.launch_passive(model, data) as v:
+    # --- Interactive wrist-camera 6-DOF control ---
+    # Camera select : 1 = left wrist   2 = right wrist
+    # Position      : Q/A = x   W/S = y   E/D = z          (5 mm/step)
+    # Rotation      : ←/→ = yaw   ↑/↓ = pitch   ,/. = roll  (5°/step)
+    # All rotations are in the wrist body frame (extrinsic):
+    #   yaw → body z-axis, pitch → body y-axis, roll → body x-axis
+    _KEY_UP, _KEY_DOWN, _KEY_LEFT, _KEY_RIGHT = 265, 264, 263, 262
+    _KEY_COMMA, _KEY_PERIOD = 44, 46
+    _KEY_Q, _KEY_A = 81, 65
+    _KEY_W, _KEY_S = 87, 83
+    _KEY_E, _KEY_D = 69, 68
+    _KEY_1, _KEY_2 = 49, 50
+
+    _WRIST_CAMS = ["cam_left_wrist", "cam_right_wrist"]
+    _POS_STEP  = 0.005   # metres
+    _ROT_STEP  = 5.0     # degrees
+
+    _cam_ids = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, n)
+                for n in _WRIST_CAMS}
+    # baseline values read from the XML-compiled model
+    _cam_base_pos  = {n: model.cam_pos [_cam_ids[n]].copy() for n in _WRIST_CAMS}
+    _cam_base_quat = {n: model.cam_quat[_cam_ids[n]].copy() for n in _WRIST_CAMS}
+    # accumulated deltas
+    _cam_dpos = {n: np.zeros(3) for n in _WRIST_CAMS}          # [dx, dy, dz]
+    _cam_drot = {n: np.zeros(3) for n in _WRIST_CAMS}          # [yaw°, pitch°, roll°]
+    _active_cam = [_WRIST_CAMS[0]]
+
+    def _quat_to_xyaxes(q: np.ndarray) -> str:
+        mat = np.zeros(9)
+        mujoco.mju_quat2Mat(mat, q)
+        R = mat.reshape(3, 3)
+        cx, cy = R[:, 0], R[:, 1]
+        return (f"{cx[0]:.4f} {cx[1]:.4f} {cx[2]:.4f}  "
+                f"{cy[0]:.4f} {cy[1]:.4f} {cy[2]:.4f}")
+
+    def _apply_cam(name: str) -> None:
+        cid = _cam_ids[name]
+
+        # position
+        new_pos = _cam_base_pos[name] + _cam_dpos[name]
+        model.cam_pos[cid] = new_pos
+
+        # rotation: extrinsic yaw(z) → pitch(y) → roll(x), pre-multiplied onto base
+        yr, pr, rr = [np.deg2rad(a) for a in _cam_drot[name]]
+        qz = np.array([np.cos(yr/2), 0.0,          0.0,          np.sin(yr/2)])
+        qy = np.array([np.cos(pr/2), 0.0,          np.sin(pr/2), 0.0         ])
+        qx = np.array([np.cos(rr/2), np.sin(rr/2), 0.0,          0.0         ])
+        tmp = np.zeros(4); q_delta = np.zeros(4); new_quat = np.zeros(4)
+        mujoco.mju_mulQuat(tmp,     qz, qy)
+        mujoco.mju_mulQuat(q_delta, tmp, qx)
+        mujoco.mju_mulQuat(new_quat, q_delta, _cam_base_quat[name])
+        model.cam_quat[cid] = new_quat
+
+        p  = new_pos
+        dr = _cam_drot[name]
+        xy = _quat_to_xyaxes(new_quat)
+        print(f"[cam] {name}")
+        print(f"      pos   : {p[0]:+.4f}  {p[1]:+.4f}  {p[2]:+.4f}"
+              f"  (Δ {_cam_dpos[name][0]:+.4f} {_cam_dpos[name][1]:+.4f} {_cam_dpos[name][2]:+.4f})")
+        print(f"      rot   : yaw={dr[0]:+.1f}°  pitch={dr[1]:+.1f}°  roll={dr[2]:+.1f}°")
+        print(f'      XML   : pos="{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}" xyaxes="{xy}"')
+
+    def _on_key(keycode: int) -> None:
+        n = _active_cam[0]
+        if   keycode == _KEY_1:
+            _active_cam[0] = _WRIST_CAMS[0]
+            print(f"[cam] Active → {_active_cam[0]}")
+        elif keycode == _KEY_2:
+            _active_cam[0] = _WRIST_CAMS[1]
+            print(f"[cam] Active → {_active_cam[0]}")
+        # position
+        elif keycode == _KEY_Q: _cam_dpos[n][0] += _POS_STEP; _apply_cam(n)
+        elif keycode == _KEY_A: _cam_dpos[n][0] -= _POS_STEP; _apply_cam(n)
+        elif keycode == _KEY_W: _cam_dpos[n][1] += _POS_STEP; _apply_cam(n)
+        elif keycode == _KEY_S: _cam_dpos[n][1] -= _POS_STEP; _apply_cam(n)
+        elif keycode == _KEY_E: _cam_dpos[n][2] += _POS_STEP; _apply_cam(n)
+        elif keycode == _KEY_D: _cam_dpos[n][2] -= _POS_STEP; _apply_cam(n)
+        # rotation
+        elif keycode == _KEY_LEFT:   _cam_drot[n][0] += _ROT_STEP; _apply_cam(n)
+        elif keycode == _KEY_RIGHT:  _cam_drot[n][0] -= _ROT_STEP; _apply_cam(n)
+        elif keycode == _KEY_UP:     _cam_drot[n][1] += _ROT_STEP; _apply_cam(n)
+        elif keycode == _KEY_DOWN:   _cam_drot[n][1] -= _ROT_STEP; _apply_cam(n)
+        elif keycode == _KEY_COMMA:  _cam_drot[n][2] += _ROT_STEP; _apply_cam(n)
+        elif keycode == _KEY_PERIOD: _cam_drot[n][2] -= _ROT_STEP; _apply_cam(n)
+
+    print("[cam] Wrist-cam 6-DOF control:")
+    print("[cam]   1/2      → select left/right wrist cam")
+    print("[cam]   Q/A      → pos x +/-     W/S → pos y +/-     E/D → pos z +/-   (5mm/step)")
+    print("[cam]   ←/→      → yaw  +/-      ↑/↓ → pitch +/-     ,/. → roll  +/-   (5°/step)")
+
+    with viewer.launch_passive(model, data, key_callback=_on_key) as v:
         t0 = time.time()
         while v.is_running():
             wall = time.time() - t0
@@ -630,16 +876,19 @@ def main():
                         addr = ctrl._qpos_addr[n]
                         data.qpos[addr] = ctrl.default[i]
                         data.qvel[ctrl.qvel_idx[n]] = 0.0
+                if grip_assist is not None:
+                    grip_assist.update()
                 step_count += 1
                 sim_time += model.opt.timestep
             v.sync()
 
-            # Head-cam preview at ~10 Hz
+            # Camera preview at ~10 Hz
             if preview is not None and time.time() - last_preview > 0.1:
                 last_preview = time.time()
-                preview.update_scene(data, camera="head_cam")
-                img = preview.render()
-                cv2.imshow("VLA head_cam", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                for cam_name in VIDEO_KEYS:
+                    preview.update_scene(data, camera=cam_name)
+                    img = preview.render()
+                    cv2.imshow(cam_name, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
 
