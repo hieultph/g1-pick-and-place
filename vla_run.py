@@ -36,6 +36,43 @@ import zmq
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+
+# --------------------------------------------------------------------------- #
+# Hz / latency monitor
+# --------------------------------------------------------------------------- #
+class HzMonitor:
+    """Counts events per named channel and reports Hz + optional stats."""
+
+    def __init__(self, report_interval: float = 5.0):
+        self._interval = report_interval
+        self._counts: dict[str, int] = {}
+        self._values: dict[str, list[float]] = {}
+        self._t0 = time.monotonic()
+
+    def tick(self, name: str) -> None:
+        self._counts[name] = self._counts.get(name, 0) + 1
+
+    def record(self, name: str, value: float) -> None:
+        self._values.setdefault(name, []).append(value)
+
+    def maybe_report(self) -> bool:
+        now = time.monotonic()
+        dt = now - self._t0
+        if dt < self._interval:
+            return False
+        parts: list[str] = []
+        for k in sorted(self._counts):
+            parts.append(f"{k}={self._counts[k] / dt:.1f}Hz")
+        for k in sorted(self._values):
+            vs = self._values[k]
+            if vs:
+                parts.append(f"{k}={np.mean(vs) * 1000:.0f}ms(avg) {max(vs) * 1000:.0f}ms(max)")
+        print(f"[Hz] {' | '.join(parts)}")
+        self._counts.clear()
+        self._values.clear()
+        self._t0 = now
+        return True
+
 # --------------------------------------------------------------------------- #
 # REAL_G1 embodiment mapping
 # --------------------------------------------------------------------------- #
@@ -96,12 +133,16 @@ DATASET_INIT_QPOS = {
     "right_hand_middle_1_joint":   0.011182,
 }
 
+_LEFT_ARM_SET  = frozenset(LEFT_ARM_JOINTS)
+_RIGHT_ARM_SET = frozenset(RIGHT_ARM_JOINTS)
+
 LANGUAGE_KEY = "annotation.human.task_description"
-VIDEO_KEYS = ["cam_left_high", "cam_right_high", "cam_left_wrist", "cam_right_wrist"]  # matches finetuning dataset
-ACTION_HORIZON = 40
-EXEC_HORIZON = 16  # how many predicted actions to execute before re-querying
+VIDEO_KEYS = ["cam_left_high", "cam_right_high"]
+EXEC_HORIZON = 40  # how many predicted actions to execute before re-querying
 IMG_H = 480
 IMG_W = 640
+OBS_H = 224   # GR00T fine-tune input resolution
+OBS_W = 224
 
 
 # --------------------------------------------------------------------------- #
@@ -217,8 +258,11 @@ def mat_to_quat(mat: np.ndarray) -> np.ndarray:
 
 def set_armature(model, joint_names):
     A_5020, A_7520_14, A_7520_22, A_4010, A_2x = 0.00360972, 0.01017752, 0.02510192, 0.00425, 0.00721945
-    for i, name in enumerate(joint_names):
-        dof = 6 + i
+    for name in joint_names:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if jid < 0:
+            continue
+        dof = int(model.jnt_dofadr[jid])
         if "elbow" in name or "shoulder" in name or "wrist_roll" in name:
             model.dof_armature[dof] = A_5020
         elif "hip_pitch" in name or "hip_yaw" in name or name == "waist_yaw_joint":
@@ -237,16 +281,17 @@ def set_armature(model, joint_names):
 # Grip assist
 # --------------------------------------------------------------------------- #
 class GripAssist:
-    """Kinematically attach a grippable object to the palm when the hand is close.
+    """Kinematically attach a grippable object between thumb and index finger.
 
-    When the palm site is within GRIP_DIST of a cube, the cube's freejoint is
-    overridden every step so the cube rigidly follows the hand.  Once latched,
-    the grip releases only when the VLA returns the fingers toward the open
-    (dataset-init) pose — detected by a low mean deviation of finger-joint qpos
-    from the init values.
+    When the midpoint of the thumb-2 tip and index-1 tip (the "pinch point") is
+    within GRIP_DIST of a cube AND the index finger is closing, the cube's
+    freejoint is overridden every step so it follows the hand.  The cube is
+    snapped to the pinch point at latch time so it always sits between the two
+    fingertips rather than near the palm.  Once latched, the grip releases when
+    the VLA opens the index finger below OPEN_THRESH.
     """
 
-    GRIP_DIST   = 0.08  # metres — latch when palm is within this radius of cube
+    GRIP_DIST   = 0.05  # metres — latch when index tip is within this radius of cube
     # Raw closure thresholds based on actual joint ranges from g1.xml:
     #   right index_0: range [0, 1.5708]  →  0 = open, positive = curling
     #   left  index_0: range [-1.5708, 0] →  0 = open, negative = curling
@@ -277,13 +322,36 @@ class GripAssist:
                 self._obj_qpos[bname] = int(model.jnt_qposadr[jid])
                 self._obj_dof [bname] = int(model.jnt_dofadr [jid])
 
-        # Palm site ids.
+        # Palm site ids (used as the reference frame for tracking).
         self._palm = {
             "left":  mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "left_palm"),
             "right": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "right_palm"),
         }
 
-        # index_0 qpos address per hand — used as the primary grip/release sensor.
+        # Distal fingertip bodies for the pinch grip.
+        # thumb_2 and index_1 are the last links; their tips are at a fixed offset
+        # in the body's local frame (read from the capsule fromto in g1.xml).
+        #   left  thumb_2 tip: local (0, -0.028, 0)
+        #   right thumb_2 tip: local (0, +0.028, 0)   (mirrored)
+        #   both  index_1 tip: local (0.028, 0, 0)
+        _distal = {
+            "left":  ("left_hand_thumb_2_link",  "left_hand_index_1_link"),
+            "right": ("right_hand_thumb_2_link", "right_hand_index_1_link"),
+        }
+        _tip_local = {
+            "left":  (np.array([0.0, -0.028, 0.0]), np.array([0.028, 0.0, 0.0])),
+            "right": (np.array([0.0,  0.028, 0.0]), np.array([0.028, 0.0, 0.0])),
+        }
+        self._pinch_bodies: dict[str, tuple[int, int]] = {}
+        self._tip_offsets:  dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for hand, (tname, iname) in _distal.items():
+            tbid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, tname)
+            ibid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, iname)
+            if tbid >= 0 and ibid >= 0:
+                self._pinch_bodies[hand] = (tbid, ibid)
+                self._tip_offsets[hand]  = _tip_local[hand]
+
+        # index_0 qpos address per hand — primary grip/release sensor.
         # We read the raw joint value and multiply by _CLOSE_DIR to get a
         # non-negative "closure" score (0 = fully open, ~1.57 = fully closed).
         self._index0_addr: dict[str, int] = {}
@@ -304,6 +372,12 @@ class GripAssist:
         mat = self.data.site_xmat[sid].reshape(3, 3).copy()
         return pos, mat
 
+    def _pinch_tip(self, hand: str) -> np.ndarray:
+        """World-space position of the index-1 fingertip."""
+        _tbid, ibid = self._pinch_bodies[hand]
+        _t_off, i_off = self._tip_offsets[hand]
+        return self.data.xpos[ibid] + self.data.xmat[ibid].reshape(3, 3) @ i_off
+
     def _index_closure(self, hand: str) -> float:
         """Raw closure of index_0: joint_value * closing_direction (≥0 when curling)."""
         addr = self._index0_addr.get(hand)
@@ -323,12 +397,14 @@ class GripAssist:
             palm_quat = mat_to_quat(palm_mat)
             idx_closure = self._index_closure(hand)
 
-            # Periodic debug: raw joint value + closure so thresholds can be tuned.
+            # Periodic debug: raw joint value + closure + pinch position for tuning.
             if self._log_counter % 200 == 0:
                 addr = self._index0_addr.get(hand)
-                raw = float(self.data.qpos[addr]) if addr is not None else float("nan")
+                raw   = float(self.data.qpos[addr]) if addr is not None else float("nan")
                 state = "GRIP" if self._grip[hand] else "open"
+                index_tip_dbg = self._pinch_tip(hand)
                 print(f"[grip] {hand} index_0 raw={raw:+.3f}  closure={idx_closure:.3f}"
+                      f"  index_tip=({index_tip_dbg[0]:.3f},{index_tip_dbg[1]:.3f},{index_tip_dbg[2]:.3f})"
                       f"  (latch>{self.GRIP_THRESH}, release<{self.OPEN_THRESH})"
                       f"  [{state}]")
 
@@ -362,23 +438,27 @@ class GripAssist:
                     latched.discard(obj_name)
 
             else:
-                # Latch only when index finger is closing AND palm is close to cube.
+                # Latch only when index finger is closing AND pinch point is near a cube.
                 if idx_closure < self.GRIP_THRESH:
                     continue  # index finger is open — don't attach anything
+                index_tip = self._pinch_tip(hand)
                 for obj_name, body_id in self._obj_body.items():
                     if obj_name in latched:
                         continue
                     obj_pos  = self.data.xpos[body_id].copy()
                     obj_quat = self.data.xquat[body_id].copy()
-                    dist = np.linalg.norm(palm_pos - obj_pos)
+                    dist = np.linalg.norm(index_tip - obj_pos)
                     if dist < self.GRIP_DIST:
-                        rel_pos  = palm_mat.T @ (obj_pos - palm_pos)
+                        # Snap the object to the index fingertip.
+                        # Store as an offset from the palm site in the palm's local frame
+                        # so tracking follows the palm's full 6-DOF motion.
+                        rel_pos  = palm_mat.T @ (index_tip - palm_pos)
                         rel_quat = quat_mul(quat_inv(palm_quat), obj_quat)
                         self._grip[hand]       = (obj_name, rel_pos, rel_quat)
                         self._grip_steps[hand] = 0
                         latched.add(obj_name)
                         print(f"[grip] {hand} latched {obj_name} "
-                              f"(dist={dist:.3f} m, index closure={idx_closure:.3f})")
+                              f"(index_tip_dist={dist:.3f} m, closure={idx_closure:.3f})")
                         break
 
 
@@ -386,6 +466,26 @@ class GripAssist:
 # Main controller
 # --------------------------------------------------------------------------- #
 class VLAController:
+    _JOINT_CLAMP: dict[str, tuple[float, float]] = {
+        "left_shoulder_pitch_joint":  (-0.8,  0.5),
+        "left_shoulder_roll_joint":   ( 0.1,  0.8),
+        "left_shoulder_yaw_joint":    (-0.9,  0.6),
+        "left_elbow_joint":           (-0.1,  1.5),
+        "left_wrist_roll_joint":      (-1.3,  1.3),
+        "left_wrist_pitch_joint":     (-0.9,  0.9),
+        "left_wrist_yaw_joint":       (-0.9,  0.9),
+        "right_shoulder_pitch_joint": (-0.8,  0.5),
+        "right_shoulder_roll_joint":  (-0.8, -0.1),
+        "right_shoulder_yaw_joint":   (-0.7,  1.2),
+        "right_elbow_joint":          (-0.1,  1.5),
+        "right_wrist_roll_joint":     (-1.4,  1.5),
+        "right_wrist_pitch_joint":    (-0.9,  0.9),
+        "right_wrist_yaw_joint":      (-1.0,  0.9),
+        "waist_yaw_joint":            (-1.0,  1.0),
+        "waist_roll_joint":           (-0.4,  0.4),
+        "waist_pitch_joint":          (-0.4,  0.4),
+    }
+
     def __init__(self, model, data, walker, config, client: PolicyClient, prompt: str,
                  freeze_non_arm: bool = True, apply_hands: bool = True,
                  save_obs_dir: str | None = None):
@@ -446,15 +546,11 @@ class VLAController:
         self.last_action = np.zeros(self.num_joints, dtype=np.float32)
         self.cmd = np.zeros(3, dtype=np.float32)  # zero vel — stationary
 
-        # Action chunk + per-chunk reference state (the "current state" at inference time)
+        self.last_infer_dt: float = 0.0
+
+        # Action chunk
         self.chunk: dict[str, np.ndarray] | None = None
         self.chunk_step = 0
-        self.chunk_ref: dict[str, np.ndarray] | None = None
-
-        # Async inference — background thread so the sim loop never blocks.
-        self._infer_lock    = threading.Lock()
-        self._pending_chunk: tuple | None = None   # (chunk_dict, elapsed_s)
-        self._infer_thread: threading.Thread | None = None
 
         # Renderer for camera observations (separate from preview)
         self.obs_renderer = mujoco.Renderer(model, IMG_H, IMG_W)
@@ -495,10 +591,13 @@ class VLAController:
         frames = {}
         for cam in VIDEO_KEYS:
             self.obs_renderer.update_scene(self.data, camera=cam)
-            frames[cam] = self.obs_renderer.render().copy()  # (H, W, 3) uint8
+            frame = self.obs_renderer.render()
+            if frame.shape[:2] != (OBS_H, OBS_W):
+                frame = cv2.resize(frame, (OBS_W, OBS_H), interpolation=cv2.INTER_LINEAR)
+            frames[cam] = frame.copy()  # (OBS_H, OBS_W, 3) uint8
         return frames
 
-    def _build_observation(self) -> dict[str, Any]:
+    def _build_observation(self) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
         # State keys must match finetuning modality (G1_Dex3_ObjectPlacement_Dataset):
         # left_arm, right_arm, left_hand, right_hand only.
         state = {
@@ -534,40 +633,15 @@ class VLAController:
         c = self.chunk
         t = min(self.chunk_step, c["right_arm"].shape[0] - 1)
 
-        # Per-joint clamp bounds (task-relevant subset of training q01/q99).
-        # Prevents the model from driving arms to extreme out-of-task poses.
-        _JOINT_CLAMP = {
-            # left arm: [lo, hi]  (training q01/q99 tightened for pick-place task)
-            "left_shoulder_pitch_joint": (-0.8, 0.5),
-            "left_shoulder_roll_joint":  (0.1, 0.8),
-            "left_shoulder_yaw_joint":   (-0.9, 0.6),
-            "left_elbow_joint":          (-0.1, 1.5),   # don't hyper-extend
-            "left_wrist_roll_joint":     (-1.3, 1.3),
-            "left_wrist_pitch_joint":    (-0.9, 0.9),
-            "left_wrist_yaw_joint":      (-0.9, 0.9),
-            # right arm
-            "right_shoulder_pitch_joint":(-0.8, 0.5),
-            "right_shoulder_roll_joint": (-0.8, -0.1),
-            "right_shoulder_yaw_joint":  (-0.7, 1.2),
-            "right_elbow_joint":         (-0.1, 1.5),   # don't hyper-extend
-            "right_wrist_roll_joint":    (-1.4, 1.5),
-            "right_wrist_pitch_joint":   (-0.9, 0.9),
-            "right_wrist_yaw_joint":     (-1.0, 0.9),
-            # waist
-            "waist_yaw_joint":           (-1.0, 1.0),
-            "waist_roll_joint":          (-0.4, 0.4),
-            "waist_pitch_joint":         (-0.4, 0.4),
-        }
-
         def apply_joint_group(names: list[str], key: str):
             vals = c[key][t]  # (D,) absolute joint targets
             for i, n in enumerate(names):
                 if n in self.joint_names:
                     idx = self.joint_names.index(n)
                     v = float(vals[i])
-                    if n in _JOINT_CLAMP:
-                        lo, hi = _JOINT_CLAMP[n]
-                        v = max(lo, min(hi, v))
+                    bounds = self._JOINT_CLAMP.get(n)
+                    if bounds:
+                        v = max(bounds[0], min(bounds[1], v))
                     target_body[idx] = v
 
         apply_joint_group(LEFT_ARM_JOINTS, "left_arm")
@@ -605,36 +679,36 @@ class VLAController:
             target_body = self.default + action * self.action_scales
             self.last_action = action.copy()
 
-        # 2) Swap in completed async chunk if ready.
-        with self._infer_lock:
-            if self._pending_chunk is not None:
-                chunk, cur_state, dt = self._pending_chunk
-                self._pending_chunk = None
-                self.chunk      = chunk
-                self.chunk_ref  = cur_state
+        # 3) VLA chunk: query if we don't have one or we've executed enough
+        if self.chunk is None or self.chunk_step >= EXEC_HORIZON:
+            try:
+                obs_dict, cur_state = self._build_observation()
+                if self.save_obs_dir:
+                    self._save_observation(obs_dict, cur_state)
+                t0 = time.monotonic()
+                action_chunk = self.client.get_action(obs_dict)
+                dt = time.monotonic() - t0
+                self.last_infer_dt = dt
+                # Strip batch dim -> (T, D)
+                self.chunk = {k: np.asarray(v)[0] for k, v in action_chunk.items()}
                 self.chunk_step = 0
-                T   = next(iter(chunk.values())).shape[0]
-                la0 = chunk["left_arm"][0]
-                ra0 = chunk["right_arm"][0]
-                print(f"[VLA] new chunk ({dt:.2f}s)  horizon={T}  keys={list(chunk.keys())}")
+                la0 = self.chunk["left_arm"][0]
+                ra0 = self.chunk["right_arm"][0]
+                T = next(iter(self.chunk.values())).shape[0]
+                print(f"[VLA] new chunk ({dt:.2f}s). keys={list(self.chunk.keys())} horizon={T}")
                 print(f"[VLA] state  left_arm ={np.round(cur_state['left_arm'],  3).tolist()}")
                 print(f"[VLA] action left_arm[0]={np.round(la0, 3).tolist()}")
                 print(f"[VLA] state  right_arm={np.round(cur_state['right_arm'], 3).tolist()}")
                 print(f"[VLA] action right_arm[0]={np.round(ra0, 3).tolist()}")
+                _applied = {"left_arm", "right_arm", "left_hand", "right_hand"}
+                _extra = set(self.chunk.keys()) - _applied
+                if _extra:
+                    print(f"[VLA] WARNING: chunk has unapplied keys {_extra}")
+            except Exception as e:
+                print(f"[VLA] inference failed: {e!r}")
+                # keep walker targets only
 
-        # 3) Kick off next inference when the current chunk is nearly exhausted,
-        #    but only if no request is already in flight.
-        infer_running = self._infer_thread is not None and self._infer_thread.is_alive()
-        if not infer_running and (self.chunk is None or self.chunk_step >= EXEC_HORIZON):
-            obs_dict, cur_state = self._build_observation()
-            if self.save_obs_dir:
-                self._save_observation(obs_dict, cur_state)
-            self._infer_thread = threading.Thread(
-                target=self._run_inference, args=(obs_dict, cur_state), daemon=True
-            )
-            self._infer_thread.start()
-
-        # 4) Apply current chunk to override upper body (sim continues unblocked).
+        # 4) Apply chunk to override upper body
         hand_ctrl: dict[int, float] = {}
         if self.chunk is not None:
             hand_ctrl = self._apply_chunk_targets(target_body)
@@ -828,6 +902,7 @@ def main():
     hand_ctrl: dict[int, float] = {}
     sim_time = 0.0
     last_preview = 0.0
+    hz_mon = HzMonitor(report_interval=5.0)
 
     # Snapshot initial floating-base pose so we can pin it every step.
     ctrl._base_qpos0 = data.qpos[:7].copy()
@@ -923,35 +998,29 @@ def main():
     print("[cam]   ←/→      → yaw  +/-      ↑/↓ → pitch +/-     ,/. → roll  +/-   (5°/step)")
 
     with viewer.launch_passive(model, data, key_callback=_on_key) as v:
-        t0 = time.time()
-        _hz_last_wall = t0
-        _hz_step_count = 0
+        t0 = time.monotonic()
         while v.is_running():
-            wall = time.time() - t0
+            wall = time.monotonic() - t0
             if wall - sim_time > 0.05:
                 sim_time = wall - 0.05
             while sim_time < wall:
                 if step_count % decimation == 0:
                     target_body, hand_ctrl = ctrl.step()
+                    hz_mon.tick("ctrl")
+                    # chunk_step resets to 0 then increments to 1 on a fresh inference
+                    if ctrl.chunk_step == 1 and ctrl.last_infer_dt > 0:
+                        hz_mon.tick("infer")
+                        hz_mon.record("infer_latency", ctrl.last_infer_dt)
                 ctrl.write_ctrl(target_body, hand_ctrl)
                 mujoco.mj_step(model, data)
-                _hz_step_count += 1
-                if _hz_step_count >= 200:  # print every 200 sim steps (~1 s at 200 Hz)
-                    now = time.time()
-                    elapsed = now - _hz_last_wall
-                    sim_hz  = _hz_step_count / elapsed          # actual sim step rate
-                    ctrl_hz = (_hz_step_count / decimation) / elapsed  # control policy rate
-                    print(f"[hz] sim={sim_hz:.1f} Hz  ctrl={ctrl_hz:.1f} Hz  "
-                          f"(target sim=200 Hz, ctrl=50 Hz)")
-                    _hz_last_wall = now
-                    _hz_step_count = 0
+                hz_mon.tick("sim")
                 if ctrl.freeze_non_arm:
                     # Pin floating base in place (kinematic freeze).
                     data.qpos[:7] = ctrl._base_qpos0
                     data.qvel[:6] = 0.0
                     # Pin non-arm body joints to default.
                     for i, n in enumerate(ctrl.joint_names):
-                        if n in LEFT_ARM_JOINTS or n in RIGHT_ARM_JOINTS:
+                        if n in _LEFT_ARM_SET or n in _RIGHT_ARM_SET:
                             continue
                         addr = ctrl._qpos_addr[n]
                         data.qpos[addr] = ctrl.default[i]
@@ -961,10 +1030,11 @@ def main():
                 step_count += 1
                 sim_time += model.opt.timestep
             v.sync()
+            hz_mon.maybe_report()
 
             # Camera preview at ~10 Hz
-            if preview is not None and time.time() - last_preview > 0.1:
-                last_preview = time.time()
+            if preview is not None and time.monotonic() - last_preview > 0.1:
+                last_preview = time.monotonic()
                 for cam_name in VIDEO_KEYS:
                     preview.update_scene(data, camera=cam_name)
                     img = preview.render()
