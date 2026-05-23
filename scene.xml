@@ -56,7 +56,7 @@
     <!-- Yellow open-top box container — center of table, static -->
     <!-- Inner area ~18x18 cm, walls 2 cm thick, 4 cm tall -->
     <!-- Mid-table; pelvis-frame: fwd=0.40, side=0.00, up=-0.077 -->
-    <body name="yellow_box" pos="-0.20 0.00 0.84">
+    <body name="yellow_box" pos="-0.15 0.00 0.84">
       <geom name="ybox_floor" type="box" size="0.10 0.10 0.005"
             pos="0 0 0.005" rgba="0.95 0.85 0.0 1"
             contype="1" conaffinity="1" mass="0.5"/>
@@ -74,21 +74,21 @@
             contype="1" conaffinity="1" mass="0.05"/>
     </body>
 
-    <!-- Red cylinder — left side of table (+Y), dynamic (freejoint) -->
-    <!-- diameter=4cm, height=7cm. Center at z = 0.815 + 0.035 = 0.850 -->
-    <body name="red_cube" pos="-0.20 0.18 0.850" quat="0.707 0.707 0 0">
+    <!-- Red box — right side of table (-Y), dynamic (freejoint) -->
+    <!-- 4x4x8 cm. Center at z = 0.810 + 0.040 = 0.850 -->
+    <body name="red_cube" pos="-0.13 -0.20 0.850" quat="0.707 0.707 0 0">
       <freejoint name="red_cube_joint"/>
-      <geom name="red_cube_geom" type="cylinder" size="0.020 0.035"
-            rgba="0.1 0.75 0.1 1" density="600"
+      <geom name="red_cube_geom" type="box" size="0.020 0.020 0.040"
+            rgba="0.85 0.1 0.1 1" density="500"
             contype="1" conaffinity="1" friction="3 0.3 0.05"/>
     </body>
 
-    <!-- Green cube — right side of table (-Y), dynamic (freejoint) -->
+    <!-- Green box — right side of table (-Y), dynamic (freejoint) -->
     <!-- 4x4x8 cm. Center at z = 0.810 + 0.040 = 0.850 -->
-    <body name="green_cube" pos="-0.20 -0.18 0.850" quat="0.707 0.707 0 0">
+    <body name="green_cube" pos="-0.13 0.20 0.850" quat="0.707 0.707 0 0">
       <freejoint name="green_cube_joint"/>
       <geom name="green_cube_geom" type="box" size="0.020 0.020 0.040"
-            rgba="0.85 0.1 0.1 1" density="500"
+            rgba="0.1 0.75 0.1 1" density="500"
             contype="1" conaffinity="1" friction="3 0.3 0.05"/>
     </body>
 

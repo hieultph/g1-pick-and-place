@@ -1,0 +1,42 @@
+# Hexagonal prism — circumradius 0.025 m, half-height 0.035 m
+# Z-axis is the prism axis (same orientation as MuJoCo cylinder).
+# Top face vertices (z = +0.035)
+v  0.025000  0.000000  0.035000
+v  0.012500  0.021651  0.035000
+v -0.012500  0.021651  0.035000
+v -0.025000  0.000000  0.035000
+v -0.012500 -0.021651  0.035000
+v  0.012500 -0.021651  0.035000
+# Bottom face vertices (z = -0.035)
+v  0.025000  0.000000 -0.035000
+v  0.012500  0.021651 -0.035000
+v -0.012500  0.021651 -0.035000
+v -0.025000  0.000000 -0.035000
+v -0.012500 -0.021651 -0.035000
+v  0.012500 -0.021651 -0.035000
+
+# Top face (CCW from +z = outward normal up)
+f 1 2 3
+f 1 3 4
+f 1 4 5
+f 1 5 6
+
+# Bottom face (CW from +z = outward normal down)
+f 7 12 11
+f 7 11 10
+f 7 10  9
+f 7  9  8
+
+# Side faces (outward normals pointing away from prism axis)
+f  1  7  8
+f  1  8  2
+f  2  8  9
+f  2  9  3
+f  3  9 10
+f  3 10  4
+f  4 10 11
+f  4 11  5
+f  5 11 12
+f  5 12  6
+f  6 12  7
+f  6  7  1
